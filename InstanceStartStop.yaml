@@ -1,0 +1,230 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for auto stop and start EC2 instances
+#
+# Metadata
+#
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: CloudWatch Events Configuration
+      Parameters:
+      - StartSchedule
+      - StopSchedule
+    - Label:
+        default: Lambda Configuration
+      Parameters:
+      - TagKey
+      - TagValue
+#
+# Parameters
+#
+Parameters:
+  StartSchedule:
+    Description: Start Datetime format cron
+    Default: 0 21 ? * SUN-THU *
+    Type: String
+  StopSchedule:
+    Description: Stop Datetime format cron
+    Default: 0 15 ? * MON-FRI *
+    Type: String
+  TagKey:
+    Description: EC2/RDS tag key
+    Default: startstop
+    Type: String
+  TagValue:
+    Description: EC2/RDS tag value
+    Default: "True"
+    Type: String
+#
+# Resources
+#
+Resources:
+  StateSchedulerExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: LambdaExecPolicy
+        PolicyDocument:
+          Statement:
+          - Sid: AccessToCWLog
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: "*"
+          - Sid: AccessToInstance
+            Effect: Allow
+            Action:
+            - ec2:DescribeInstances
+            - ec2:StartInstances
+            - ec2:StopInstances
+            - rds:DescribeDBInstances
+            - rds:DescribeDBClusters
+            - rds:StartDBInstance
+            - rds:StopDBInstance
+            - rds:StartDBCluster
+            - rds:StopDBCluster
+            - rds:ListTagsForResource
+            Resource: "*"
+          - Sid: AccessToKMS
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:GenerateDataKeyWithoutPlaintext
+            - kms:CreateGrant
+            Resource: "*"
+  StartScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ScheduledRule for start instance
+      ScheduleExpression: !Sub cron(${StartSchedule})
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt [ StateSchedulerFunction, Arn ]
+        Id: StateSchedulerFunction
+  StopScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ScheduledRule for stop instance
+      ScheduleExpression: !Sub cron(${StopSchedule})
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt [ StateSchedulerFunction, Arn ]
+        Id: StateSchedulerFunction
+  PermissionForStartEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StateSchedulerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt [ StartScheduledRule, Arn ]
+  PermissionForStopEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StateSchedulerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt [ StopScheduledRule, Arn ]
+  StateSchedulerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          TagKey: !Ref TagKey
+          TagValue: !Ref TagValue
+      Description: Scheduled EC2 stop and start.
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt [ StateSchedulerExecRole, Arn ]
+      Runtime: python3.7
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import urllib.request
+          import json
+          import datetime
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+          TAG_KEY = os.environ['TagKey']
+          TAG_VALUE = os.environ['TagValue']
+          EC2 = boto3.resource('ec2')
+          RDS = boto3.client('rds')
+
+          def holiday_check():
+              today = (datetime.datetime.now() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d')
+              holiday_url = 'https://holidays-jp.github.io/api/v1/date.json'
+              req = urllib.request.Request(holiday_url)          
+              with urllib.request.urlopen(req) as res:
+                  holiday_list = json.load(res)
+              try:
+                  logger.info('本日%sは%sで祝日です。スキップします。',today,holiday_list[today])
+                  return True
+              except KeyError as e:
+                  logger.info('本日%sは祝日ではありません。続行します。',today)
+                  return False
+
+          def get_target_ec2_instances():
+              filters = [{ 'Name': 'tag:' + TAG_KEY, 'Values': [TAG_VALUE] }]
+              return EC2.instances.filter(Filters=filters)
+
+          def get_target_rds_instances():
+              instances = RDS.describe_db_instances()
+              return [
+                  i for i in instances['DBInstances']
+                  for tag in RDS.list_tags_for_resource(ResourceName=i['DBInstanceArn'])['TagList']
+                  if tag['Key'] == TAG_KEY and tag['Value'] == TAG_VALUE
+              ]
+
+          def get_target_rds_clusters():
+              clusters = RDS.describe_db_clusters()
+              return [
+                  i for i in clusters['DBClusters']
+                  for tag in RDS.list_tags_for_resource(ResourceName=i['DBClusterArn'])['TagList']
+                  if tag['Key'] == TAG_KEY and tag['Value'] == TAG_VALUE
+              ]
+
+          def schedule_instance(event):
+              ec2_instances = get_target_ec2_instances()
+              rds_instances = get_target_rds_instances()
+              rds_clusters = get_target_rds_clusters()
+              logger.info("Target EC2 instances: \n%s" % str(
+                  [(i.id, tag['Value']) for i in ec2_instances for tag in i.tags if tag.get('Key')=='Name']
+              ))
+              logger.info("Target RDS instances: \n%s" % str(
+                  [(i['DBInstanceIdentifier']) for i in rds_instances]
+              ))
+              logger.info("Target RDS clusters: \n%s" % str(
+                  [(i['DBClusterIdentifier']) for i in rds_clusters]
+              ))
+
+              if [ r for r in event.get('resources') if r.count('StartScheduledRule') ]:
+                  logger.info('Start EC2 instances')
+                  logger.info(ec2_instances.start())
+                  logger.info('Start RDS instances')
+                  for instance in rds_instances:
+                      if instance['DBInstanceStatus'] == 'stopped':
+                          logger.info(RDS.start_db_instance(DBInstanceIdentifier=instance['DBInstanceIdentifier']))
+                      else:
+                          logger.info('{} status is not "stopped"'.format(instance['DBInstanceIdentifier']))
+                  logger.info('Start RDS clusters')
+                  for cluster in rds_clusters:
+                      if cluster['Status'] == 'stopped':
+                          logger.info(RDS.start_db_cluster(DBClusterIdentifier=cluster['DBClusterIdentifier']))
+                      else:
+                          logger.info('{} status is not "stopped"'.format(cluster['DBClusterIdentifier']))
+              elif [ r for r in event.get('resources') if r.count('StopScheduledRule') ]:
+                  logger.info('Stop EC2 instances')
+                  logger.info(ec2_instances.stop())
+                  logger.info('Stop RDS instances')
+                  for instance in rds_instances:
+                      if instance['DBInstanceStatus'] == 'available':
+                          logger.info(RDS.stop_db_instance(DBInstanceIdentifier=instance['DBInstanceIdentifier']))
+                      else:
+                          logger.info('{} status is not "available"'.format(instance['DBInstanceIdentifier']))
+                  logger.info('Stop RDS clusters')
+                  for cluster in rds_clusters:
+                      if cluster['Status'] == 'available':
+                          logger.info(RDS.stop_db_cluster(DBClusterIdentifier=cluster['DBClusterIdentifier']))
+                      else:
+                          logger.info('{} status is not "available"'.format(cluster['DBClusterIdentifier']))
+
+          def lambda_handler(event, context):
+              logger.info('Started')
+              if not holiday_check():
+                  schedule_instance(event)
+              logger.info('Complete')
