@@ -24,5 +24,5 @@ EC2、RDSインスタンス、RDSクラスター（Aurora）に対応済み。
 ## 祝日の実行について
 
 停止起動処理（Lamnda）の中で祝日判定を行っており、祝日であれば処理がスキップされるようになっている。祝日情報は下記から取得しています。
-https://qiita.com/matsuoshi/items/7c19e7dcf404b7d921d6
+https://holidays-jp.github.io
 
