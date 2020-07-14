@@ -1,6 +1,6 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
-Description: CloudFormation template for auto stop and start EC2 instances
+Description: CloudFormation template for auto stop and start EC2 and RDS instances
 #
 # Metadata
 #
